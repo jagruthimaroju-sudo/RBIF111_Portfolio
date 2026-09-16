@@ -1,0 +1,261 @@
+---
+title: "Glucose Levels and In-Hospital Mortality in MIMIC-III"
+author: "Jagruthi Maroju"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Introduction
+
+Abnormal glucose regulation is common among hospitalized patients and can occur in response to underlying disease, metabolic dysfunction, and physiological stress. The objective of this analysis is to determine whether admission-level blood glucose measurements differ between patients who survived hospitalization and patients who died during hospitalization.
+
+Data were obtained from the MIMIC-III demo dataset stored in a local DuckDB repository. Laboratory measurements were retrieved from the `MIMICIII_DEMO_LABEVENTS` table and linked to hospital outcomes in the `MIMICIII_DEMO_ADMISSIONS` table. The analysis evaluates the distribution of glucose measurements before selecting an appropriate hypothesis test and also considers the statistical power of the comparison.
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(DBI)
+library(duckdb)
+library(ggplot2)
+library(dplyr)
+
+db_path <- paste0(
+    "C:/Users/jagru/Documents/RBIF_Database/",
+    "repoquet_public_example/formatted/Repository.duckdb"
+)
+
+con <- dbConnect(
+    duckdb(),
+    dbdir = db_path,
+    read_only = TRUE
+)
+```
+
+# Data Retrieval
+
+Glucose measurements were identified using MIMIC-III `ITEMID = 50931`. Because patients may have multiple glucose measurements during the same hospital admission, measurements were averaged within each admission. This produces one admission-level glucose value for the analysis and prevents repeated measurements from the same admission from being treated as independent observations.
+
+```{r query-data}
+glucose_data <- dbGetQuery(
+    con,
+    "
+    SELECT
+        a.HADM_ID,
+        a.HOSPITAL_EXPIRE_FLAG,
+        AVG(l.VALUENUM) AS Glucose
+
+    FROM MIMICIII_DEMO_ADMISSIONS AS a
+
+    INNER JOIN MIMICIII_DEMO_LABEVENTS AS l
+        ON a.HADM_ID = l.HADM_ID
+
+    WHERE
+        a.HOSPITAL_EXPIRE_FLAG IN (0, 1)
+        AND l.ITEMID = 50931
+        AND l.VALUENUM IS NOT NULL
+
+    GROUP BY
+        a.HADM_ID,
+        a.HOSPITAL_EXPIRE_FLAG
+
+    ORDER BY
+        a.HADM_ID
+    "
+)
+
+glucose_data$Outcome <- factor(
+    glucose_data$HOSPITAL_EXPIRE_FLAG,
+    levels = c(0, 1),
+    labels = c("Survived", "Died")
+)
+
+table(glucose_data$Outcome)
+```
+
+The dataset contains admission-level glucose measurements for both patients who survived hospitalization and patients who died during hospitalization.
+
+# Exploratory Analysis
+
+The distribution of glucose measurements was first examined by hospital outcome.
+
+```{r boxplot, fig.width=8, fig.height=5}
+ggplot(
+    glucose_data,
+    aes(
+        x = Outcome,
+        y = Glucose,
+        fill = Outcome
+    )
+) +
+    geom_boxplot() +
+    labs(
+        title = "Admission-Level Glucose by Hospital Outcome",
+        x = "Hospital Outcome",
+        y = "Mean Glucose"
+    ) +
+    theme_bw() +
+    theme(
+        legend.position = "none"
+    )
+```
+
+The distributions show considerable variability and several relatively high glucose measurements. The group of patients who died also appears to have a higher central glucose value than the group that survived.
+
+# Normality Assessment
+
+Before selecting a hypothesis test, normality was evaluated separately within each outcome group using Shapiro-Wilk tests and QQ plots.
+
+```{r normality}
+glucose_survived <- glucose_data$Glucose[
+    glucose_data$Outcome == "Survived"
+]
+
+glucose_died <- glucose_data$Glucose[
+    glucose_data$Outcome == "Died"
+]
+
+shapiro_survived <- shapiro.test(glucose_survived)
+shapiro_died <- shapiro.test(glucose_died)
+
+shapiro_survived
+shapiro_died
+```
+
+```{r qqplots, fig.width=9, fig.height=5}
+ggplot(
+    glucose_data,
+    aes(sample = Glucose)
+) +
+    stat_qq() +
+    stat_qq_line() +
+    facet_wrap(
+        ~ Outcome,
+        scales = "free"
+    ) +
+    labs(
+        title = "QQ Plots of Glucose by Hospital Outcome",
+        x = "Theoretical Quantiles",
+        y = "Sample Quantiles"
+    ) +
+    theme_bw()
+```
+
+The Shapiro-Wilk tests indicate evidence of non-normality in both outcome groups. The QQ plots also show departures from the reference line, particularly in the upper tails. Because the normality assumption was not supported, a non-parametric Wilcoxon rank-sum test was selected instead of a two-sample t-test.
+
+# Hypothesis Test
+
+The null hypothesis is that the glucose distributions are the same between patients who survived hospitalization and patients who died during hospitalization. The alternative hypothesis is that the glucose distributions differ between the two groups.
+
+```{r hypothesis-test}
+glucose_test <- wilcox.test(
+    Glucose ~ Outcome,
+    data = glucose_data,
+    exact = FALSE
+)
+
+glucose_test
+```
+
+Descriptive statistics were also calculated for interpretation.
+
+```{r descriptive-statistics}
+glucose_summary <- glucose_data %>%
+    group_by(Outcome) %>%
+    summarise(
+        N = n(),
+        Mean = mean(Glucose),
+        Median = median(Glucose),
+        SD = sd(Glucose)
+    )
+
+glucose_summary
+```
+
+The median admission-level glucose was approximately 122.53 among patients who survived and 149.35 among patients who died. The Wilcoxon rank-sum test produced a p-value of approximately 0.000925. At a significance level of 0.05, this provides evidence that the glucose distributions differ between the two hospital-outcome groups. The result demonstrates an association in this sample and should not be interpreted as evidence that higher glucose itself caused mortality.
+
+# Statistical Power
+
+Although the observed glucose distributions were non-normal and the primary hypothesis test was therefore the Wilcoxon rank-sum test, analytical power was estimated using `power.t.test()` based on the observed difference in group means and pooled variance. This provides an approximate assessment of the ability of the available sample to detect a difference of the observed magnitude.
+
+```{r power-analysis}
+n_survived <- length(glucose_survived)
+n_died <- length(glucose_died)
+
+mean_survived <- mean(glucose_survived)
+mean_died <- mean(glucose_died)
+
+var_survived <- var(glucose_survived)
+var_died <- var(glucose_died)
+
+pooled_var <- (
+    (n_survived - 1) * var_survived +
+    (n_died - 1) * var_died
+) /
+(
+    n_survived + n_died - 2
+)
+
+pooled_sd <- sqrt(pooled_var)
+
+delta <- abs(
+    mean_survived - mean_died
+)
+
+delta
+pooled_sd
+```
+
+Because `power.t.test()` assumes equal group sizes, the smaller observed group size can be used as a conservative approximation of the available sample size per group.
+
+```{r observed-power}
+actual_n <- min(
+    n_survived,
+    n_died
+)
+
+observed_power <- power.t.test(
+    n = actual_n,
+    delta = delta,
+    sd = pooled_sd,
+    sig.level = 0.05,
+    type = "two.sample",
+    alternative = "two.sided"
+)
+
+observed_power
+```
+
+The sample size required for approximately 80% power can also be estimated.
+
+```{r required-power}
+required_n <- power.t.test(
+    power = 0.80,
+    delta = delta,
+    sd = pooled_sd,
+    sig.level = 0.05,
+    type = "two.sample",
+    alternative = "two.sided"
+)
+
+required_n
+
+ceiling(required_n$n)
+```
+
+The power analysis provides additional context for the hypothesis test by considering the observed effect magnitude relative to variability and sample size. Statistical significance alone does not indicate whether a study was adequately powered, making power an important component of interpreting group comparisons.
+
+# Conclusion
+
+This analysis examined whether admission-level glucose measurements differed between patients who survived hospitalization and patients who died during hospitalization in the MIMIC-III demo dataset. Normality testing demonstrated that glucose was not normally distributed within either outcome group, so a Wilcoxon rank-sum test was selected instead of automatically applying a t-test.
+
+The analysis identified a statistically significant difference in glucose distributions between the two groups, with higher median admission-level glucose among patients who died. Incorporating the normality assessment ensured that the statistical test was appropriate for the observed data, while the power analysis provided additional information about whether the available sample size was sufficient to detect an effect of the observed magnitude.
+
+Together, these results demonstrate the importance of evaluating distributional assumptions, effect size, sample size, and statistical power when interpreting hypothesis tests rather than relying on a p-value alone.
+
+```{r cleanup, include=FALSE}
+dbDisconnect(con, shutdown = TRUE)
+```
