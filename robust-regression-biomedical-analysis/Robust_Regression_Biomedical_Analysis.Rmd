@@ -1,0 +1,448 @@
+---
+title: "Robust Regression for Evaluating Influential Observations in RNA-seq Data"
+author: "Jagruthi Maroju"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Introduction
+
+Ordinary least-squares (OLS) linear regression is commonly used to examine relationships between continuous variables. OLS estimates a relationship by minimizing the sum of squared residuals. Because large residuals are squared, individual observations that differ substantially from the overall pattern can have a strong influence on the estimated regression line. This can be particularly important in biomedical datasets, where unusual observations may result from technical variation, biological heterogeneity, or genuine differences between individuals.
+
+Robust regression provides an alternative approach that reduces the influence of observations with large residuals without automatically removing those observations from the analysis. In this analysis, I use robust regression to examine the relationship between body mass index (BMI) and normalized expression of GeneID 633 in the GSE199225 RNA-seq dataset. I compare the robust model with a standard OLS linear regression to determine whether influential observations affect the estimated relationship.
+
+The purpose of this analysis is not to establish an independent causal effect of BMI on gene expression. BMI is strongly associated with CTRL/PCOS status in this cohort, making disease status an important potential confounder. Instead, this analysis demonstrates how robust regression can reveal whether a fitted relationship is sensitive to unusual observations.
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+library(GEOquery)
+library(DESeq2)
+library(MASS)
+
+set.seed(123)
+```
+
+# Reproducible Data Retrieval
+
+The analysis uses the human RNA-seq dataset GSE199225. Standardized raw RNA-seq counts are retrieved reproducibly from the NCBI Gene Expression Omnibus rather than being manually entered.
+
+```{r data-download, message=FALSE, warning=FALSE}
+DS <- "GSE199225"
+
+count_url <- paste0(
+  "https://www.ncbi.nlm.nih.gov/geo/download/",
+  "?format=file&type=rnaseq_counts",
+  "&acc=", DS,
+  "&file=", DS,
+  "_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+)
+
+counts_raw <- fread(count_url)
+
+gse <- getGEO(
+  DS,
+  GSEMatrix = TRUE,
+  getGPL = FALSE
+)
+
+gse199225 <- gse[[1]]
+
+sample_meta <- pData(gse199225)
+
+dim(counts_raw)
+dim(sample_meta)
+```
+
+# Sample Metadata
+
+The GEO metadata contain participant identifiers, disease status, BMI, and experimental conditions. I extracted the variables required for this analysis into a simplified metadata table.
+
+```{r metadata}
+meta <- data.frame(
+  GSM = sample_meta$geo_accession,
+  Participant = sample_meta$`participant id:ch1`,
+  Disease = sample_meta$`disease:ch1`,
+  BMI = as.numeric(
+    sample_meta$`body mass index (kg/m2):ch1`
+  ),
+  Group = sample_meta$`group:ch1`,
+  stringsAsFactors = FALSE
+)
+
+head(meta)
+```
+
+The full dataset contains repeated experimental measurements from the same participants. Treating all of these samples as independent observations would introduce pseudoreplication. Therefore, I selected the untreated `noEPS_null` condition for both CTRL and PCOS participants so that each participant contributed only one observation.
+
+```{r participant-selection}
+portfolio_meta <- subset(
+  meta,
+  Group %in% c(
+    "CTRL_noEPS_null",
+    "PCOS_noEPS_null"
+  )
+)
+
+portfolio_meta <- portfolio_meta[
+  order(portfolio_meta$Participant),
+]
+
+portfolio_meta
+```
+
+The resulting dataset contains 11 independent participants.
+
+```{r sample-check}
+cat(
+  "Number of samples:",
+  nrow(portfolio_meta),
+  "\n"
+)
+
+cat(
+  "Number of unique participants:",
+  length(unique(portfolio_meta$Participant)),
+  "\n"
+)
+
+table(portfolio_meta$Disease)
+
+summary(portfolio_meta$BMI)
+```
+
+Six participants belong to the CTRL group and five belong to the PCOS group. BMI ranges from approximately 18.7 to 43.3 kg/m².
+
+An important limitation is that BMI is strongly separated by disease status in this cohort. CTRL participants generally have lower BMI values, whereas PCOS participants generally have higher BMI values. Therefore, an association between BMI and expression cannot be interpreted as an independent BMI effect without accounting for this confounding.
+
+# RNA-seq Normalization
+
+Raw RNA-seq counts are affected by differences in sequencing depth and library composition between samples. I therefore normalized the counts using DESeq2 size-factor normalization before fitting the statistical models.
+
+First, the count matrix was restricted to the 11 selected samples.
+
+```{r count-preparation}
+portfolio_raw <- as.matrix(
+  counts_raw[, portfolio_meta$GSM, with = FALSE]
+)
+
+rownames(portfolio_raw) <- counts_raw$GeneID
+
+storage.mode(portfolio_raw) <- "integer"
+
+dim(portfolio_raw)
+
+identical(
+  colnames(portfolio_raw),
+  portfolio_meta$GSM
+)
+```
+
+A DESeq2 dataset was then created. The purpose of DESeq2 here is normalization rather than differential-expression testing, so an intercept-only design was used.
+
+```{r normalization, message=FALSE, warning=FALSE}
+portfolio_coldata <- data.frame(
+  BMI = portfolio_meta$BMI,
+  row.names = portfolio_meta$GSM
+)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = portfolio_raw,
+  colData = portfolio_coldata,
+  design = ~ 1
+)
+
+dds <- estimateSizeFactors(dds)
+
+normalized_counts <- counts(
+  dds,
+  normalized = TRUE
+)
+
+expression_matrix <- log2(
+  normalized_counts + 1
+)
+
+sizeFactors(dds)
+```
+
+The normalized counts were transformed using `log2(normalized count + 1)` before regression analysis.
+
+# GeneID 633
+
+GeneID 633 was selected as an example in which an unusual observation affects the estimated BMI-expression relationship while measurable expression remains present across most participants.
+
+```{r gene-data}
+gene <- "633"
+
+gene_idx <- match(
+  gene,
+  rownames(expression_matrix)
+)
+
+if (is.na(gene_idx)) {
+  stop("GeneID 633 was not found in the expression matrix.")
+}
+
+analysis_data <- data.frame(
+  Participant = portfolio_meta$Participant,
+  Disease = portfolio_meta$Disease,
+  BMI = portfolio_meta$BMI,
+  Expression = as.numeric(
+    expression_matrix[gene_idx, ]
+  )
+)
+
+analysis_data
+```
+
+# Ordinary Least-Squares Regression
+
+I first fit a standard OLS linear regression model using BMI as the predictor and normalized gene expression as the response.
+
+```{r ols}
+ols_model <- lm(
+  Expression ~ BMI,
+  data = analysis_data
+)
+
+summary(ols_model)
+```
+
+The OLS model estimates the average linear relationship between BMI and expression by minimizing the sum of squared residuals. Because residuals are squared, observations with particularly large residuals can have substantial influence on the fitted relationship.
+
+For GeneID 633, the OLS model estimated a positive BMI coefficient of approximately 0.185.
+
+```{r ols-coefficient}
+coef(ols_model)
+```
+
+The OLS p-value for the BMI coefficient was approximately 0.085. Therefore, the association did not meet the conventional 0.05 significance threshold in this small dataset.
+
+# Robust Regression
+
+I next fit a robust regression model using the `rlm()` function from the MASS package.
+
+```{r robust}
+robust_model <- rlm(
+  Expression ~ BMI,
+  data = analysis_data
+)
+
+summary(robust_model)
+```
+
+Robust regression addresses a different problem from nonlinear methods such as LOESS or GAMs. Those methods primarily allow the shape of the fitted relationship to change. Robust regression instead retains the assumed linear relationship while reducing the influence of observations with large residuals.
+
+The robust model estimated a positive BMI coefficient of approximately 0.130, which was smaller than the OLS estimate.
+
+# Comparison of Model Estimates
+
+The coefficient estimates from the two models can be compared directly.
+
+```{r coefficient-comparison}
+model_comparison <- data.frame(
+  Model = c(
+    "Ordinary least squares",
+    "Robust regression"
+  ),
+  Intercept = c(
+    unname(coef(ols_model)[1]),
+    unname(coef(robust_model)[1])
+  ),
+  BMI_Slope = c(
+    unname(coef(ols_model)["BMI"]),
+    unname(coef(robust_model)["BMI"])
+  )
+)
+
+model_comparison
+```
+
+The OLS model estimated a BMI slope of approximately 0.185, whereas robust regression estimated a slope of approximately 0.130. Both models therefore estimated the same positive direction of association, but the magnitude of the estimated relationship decreased after reducing the influence of unusual observations.
+
+This is an important distinction. Robust regression did not reveal an entirely different direction of association. Instead, it demonstrated that the estimated magnitude of the relationship was sensitive to particular observations.
+
+# Visualization of OLS and Robust Regression
+
+The two fitted regression lines can be visualized on the same scatterplot.
+
+```{r model-plot, fig.width=8, fig.height=6}
+plot(
+  analysis_data$BMI,
+  analysis_data$Expression,
+  pch = 19,
+  xlab = expression("BMI (kg/m"^2*")"),
+  ylab = "log2(Normalized Expression + 1)",
+  main = "OLS and Robust Regression Fits for GeneID 633"
+)
+
+abline(
+  ols_model,
+  lwd = 2,
+  lty = 1
+)
+
+abline(
+  robust_model,
+  lwd = 2,
+  lty = 2
+)
+
+text(
+  analysis_data$BMI,
+  analysis_data$Expression,
+  labels = analysis_data$Participant,
+  pos = 3,
+  cex = 0.7
+)
+
+legend(
+  "bottomright",
+  legend = c(
+    "Ordinary least squares",
+    "Robust regression"
+  ),
+  lty = c(1, 2),
+  lwd = 2,
+  bty = "n"
+)
+```
+
+The fitted lines show that both methods estimate a positive relationship between BMI and GeneID 633 expression. However, the difference between the OLS and robust regression lines indicates that the magnitude of the OLS relationship is affected by observations that do not closely follow the pattern represented by most participants.
+
+# Identifying Influential Observations
+
+One advantage of the robust regression model is that its final weights provide information about how strongly individual observations contribute to the fitted relationship.
+
+I added the OLS residuals, robust residuals, and robust-regression weights to the analysis table.
+
+```{r robust-weights}
+analysis_data$OLS_Residual <- resid(ols_model)
+
+analysis_data$Robust_Residual <- resid(
+  robust_model
+)
+
+analysis_data$Robust_Weight <- robust_model$w
+
+analysis_data[
+  order(analysis_data$Robust_Weight),
+]
+```
+
+Participant LC6 received the smallest robust-regression weight, approximately 0.256. This participant had a BMI of 21.51 kg/m² and normalized log2 expression of approximately 2.58, which was substantially below many of the other observations.
+
+The robust model did not remove LC6 from the analysis. Instead, the observation remained in the dataset but received less influence when the robust regression coefficients were estimated.
+
+This distinction is important for biomedical data. An unusual observation should not automatically be considered an error. It could reflect measurement error or technical variation, but it could also represent genuine biological heterogeneity between individuals. Robust regression provides a way to reduce the statistical influence of such observations without making the stronger decision to exclude them entirely.
+
+# Robust Weights
+
+The robust weights can also be visualized directly.
+
+```{r weight-plot, fig.width=8, fig.height=6}
+weight_order <- order(
+  analysis_data$Robust_Weight
+)
+
+barplot(
+  analysis_data$Robust_Weight[weight_order],
+  names.arg = analysis_data$Participant[weight_order],
+  las = 2,
+  ylim = c(0, 1.1),
+  ylab = "Robust Regression Weight",
+  xlab = "Participant",
+  main = "Observation Weights from Robust Regression"
+)
+
+abline(
+  h = 1,
+  lty = 2
+)
+```
+
+Most observations retained a weight of 1, indicating that they were not substantially down-weighted by the robust fitting procedure. LC6 received the smallest weight, while LC3 and LC5 also received weights below 1. This visualization makes the influence adjustment performed by robust regression directly observable.
+
+# Residual Analysis
+
+Residuals from the OLS model provide another way to examine observations that do not closely follow the fitted relationship.
+
+```{r residual-plot, fig.width=8, fig.height=6}
+plot(
+  fitted(ols_model),
+  resid(ols_model),
+  pch = 19,
+  xlab = "OLS Fitted Expression",
+  ylab = "OLS Residual",
+  main = "OLS Residuals for GeneID 633"
+)
+
+abline(
+  h = 0,
+  lty = 2
+)
+
+text(
+  fitted(ols_model),
+  resid(ols_model),
+  labels = analysis_data$Participant,
+  pos = 3,
+  cex = 0.7
+)
+```
+
+Observations farther from zero have larger residuals and therefore differ more substantially from the expression values predicted by the OLS model. Comparing this plot with the robust-regression weights demonstrates how unusual observations can influence an OLS model and how robust regression responds to them.
+
+# Statistical Interpretation
+
+The standard OLS model estimated a positive BMI-expression slope of approximately 0.185. The OLS p-value for BMI was approximately 0.085, meaning that the relationship did not meet the conventional 0.05 significance threshold.
+
+Robust regression also estimated a positive relationship but produced a smaller slope of approximately 0.130 after reducing the influence of observations with large residuals. Unlike `lm()`, the `rlm()` implementation used here does not provide an ordinary OLS ANOVA p-value that should be interpreted as directly interchangeable with the OLS p-value. I therefore focused the robust-regression comparison on the coefficient estimates, fitted relationships, residuals, and observation weights rather than treating the robust model as simply another source of a conventional p-value.
+
+The primary contribution of robust regression in this example is not the discovery of a completely different relationship. Instead, it shows that the magnitude of the estimated association is sensitive to influential observations. Participant LC6 received a robust weight of approximately 0.256, demonstrating that the robust fitting procedure identified this observation as inconsistent with the pattern represented by most of the data.
+
+# Biological Interpretation
+
+The statistical relationship between BMI and GeneID 633 expression should be interpreted as exploratory. Both OLS and robust regression estimated a positive association, but the difference in slopes demonstrates that individual participants can affect the apparent strength of the relationship.
+
+An important limitation is that BMI and disease status are strongly associated in this cohort. The CTRL participants have substantially lower BMI values than the PCOS participants. Consequently, a relationship between BMI and gene expression could reflect BMI, PCOS status, another biological difference between the groups, or a combination of these factors.
+
+Robust regression does not resolve this confounding. Its purpose in this analysis is narrower: it evaluates whether unusual observations have disproportionate influence on the fitted relationship. A larger study containing CTRL and PCOS participants across overlapping BMI ranges would be necessary to distinguish an independent BMI-associated expression effect from a disease-associated effect.
+
+The analysis also contains only 11 independent participants. Therefore, the fitted relationships should not be generalized to a larger population without additional validation.
+
+# What Robust Regression Added
+
+The OLS model alone showed a positive but statistically non-significant relationship between BMI and GeneID 633 expression. However, the OLS coefficient did not directly show how sensitive that relationship was to individual observations.
+
+Robust regression added information about this sensitivity. The estimated BMI slope decreased from approximately 0.185 under OLS to approximately 0.130 under robust regression. The robust weights also identified LC6 as having substantially less influence on the robust model than most other participants.
+
+Therefore, the main additional insight from robust regression was not that the direction of the relationship changed, but that its estimated magnitude depended partly on influential observations. This information would be difficult to obtain by examining the OLS coefficient and p-value alone.
+
+# Limitations
+
+Several limitations should be considered when interpreting this analysis. First, only 11 independent participants were available after selecting one consistent experimental condition per participant. Second, BMI and CTRL/PCOS status are strongly confounded in this cohort, preventing the BMI coefficient from being interpreted as an independent biological effect. Third, robust regression can reduce the influence of unusual observations but cannot determine why those observations are unusual.
+
+Finally, the selection of GeneID 633 was intended to demonstrate the statistical behavior of robust regression. The analysis should therefore be considered a methodological and exploratory example rather than confirmatory evidence for a specific biological mechanism.
+
+# Conclusion
+
+This analysis demonstrates how robust regression can complement ordinary linear regression in biomedical data. OLS and robust regression both estimated a positive relationship between BMI and GeneID 633 expression, but the robust model estimated a smaller slope after reducing the influence of unusual observations.
+
+Examination of the robust weights identified participant LC6 as particularly influential. Rather than deleting this observation, robust regression retained it while reducing its contribution to estimation of the regression coefficients. This demonstrates an important advantage of robust regression when unusual observations may represent genuine biological heterogeneity rather than obvious data errors.
+
+At the same time, robust regression does not correct confounding, establish causality, or eliminate the need to investigate influential observations. The small sample size and strong relationship between BMI and CTRL/PCOS status remain important limitations. Overall, the comparison demonstrates how robust regression can provide information about the stability of a fitted relationship that is not apparent from an ordinary least-squares model alone.
+
+# Session Information
+
+The following information records the R environment and package versions used to perform the analysis, supporting reproducibility.
+
+```{r session-info}
+sessionInfo()
+```
