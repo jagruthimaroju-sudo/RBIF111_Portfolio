@@ -1,0 +1,173 @@
+---
+title: "Ordinal Logistic Regression of Breast Cancer Stage"
+author: "Jagruthi Maroju"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Introduction
+
+Clinical outcomes are often measured using categories that have a meaningful order but do not have equal numerical spacing. Cancer stage is an example: Stage III represents more advanced disease than Stage II, but the difference between stages cannot be assumed to represent equal numerical intervals.
+
+This analysis demonstrates **ordinal logistic regression**, specifically the proportional-odds model, using TCGA breast cancer (TCGA-BRCA) data. The analysis examines whether tumor ERBB2 mRNA expression is associated with breast cancer disease stage. A conventional one-way ANOVA is also performed as a standard comparison.
+
+# Data and Methods
+
+## Load Data
+
+```{r load-data}
+clinical <- read.csv(
+  "TCGA_BRCA_clinical_data.csv",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+mrna <- read.csv(
+  "TCGA_BRCA_mRNA_expression.csv",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+```
+
+## Extract ERBB2 Expression
+
+```{r extract-erbb2}
+erbb2 <- mrna[mrna[[1]] == "ERBB2", ]
+
+tumor_expr <- as.numeric(
+  erbb2[1, clinical$Sample_ID_Tumor]
+)
+
+clinical$ERBB2_tumor <- tumor_expr
+```
+
+## Prepare Ordered Disease Stage
+
+Only patients with Stage I through Stage IV disease and available ERBB2 tumor expression were retained. Because Stage IV contained only two patients, Stages III and IV were combined into a single Stage III/IV category.
+
+```{r prepare-data}
+ordinal_data <- clinical[
+  clinical$Disease_Stage %in%
+    c("Stage I", "Stage II", "Stage III", "Stage IV") &
+  !is.na(clinical$ERBB2_tumor),
+]
+
+ordinal_data$Stage_Group <- ifelse(
+  ordinal_data$Disease_Stage %in% c("Stage III", "Stage IV"),
+  "Stage III/IV",
+  ordinal_data$Disease_Stage
+)
+
+ordinal_data$Stage_Group <- ordered(
+  ordinal_data$Stage_Group,
+  levels = c("Stage I", "Stage II", "Stage III/IV")
+)
+
+ordinal_data$ERBB2_10k <- ordinal_data$ERBB2_tumor / 10000
+
+table(ordinal_data$Stage_Group)
+```
+
+# Exploratory Analysis
+
+```{r figure, fig.width=7, fig.height=5}
+library(ggplot2)
+
+ggplot(ordinal_data, aes(x = Stage_Group, y = ERBB2_tumor)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1.8) +
+  labs(
+    title = "ERBB2 Expression Across Ordered Breast Cancer Stages",
+    subtitle = "TCGA-BRCA",
+    x = "Disease Stage",
+    y = "Tumor ERBB2 mRNA Expression"
+  ) +
+  theme_classic(base_size = 12)
+```
+
+**Figure 1. ERBB2 tumor mRNA expression across ordered breast cancer stage groups.**
+
+# Standard Analysis: One-Way ANOVA
+
+```{r anova}
+anova_model <- aov(
+  ERBB2_tumor ~ Stage_Group,
+  data = ordinal_data
+)
+
+summary(anova_model)
+```
+
+The one-way ANOVA found no statistically significant difference in mean ERBB2 expression among the disease-stage groups, **F(2, 99) = 0.590, p = 0.556**.
+
+# Ordinal Logistic Regression
+
+```{r ordinal-model}
+library(MASS)
+
+ordinal_model <- polr(
+  Stage_Group ~ ERBB2_10k,
+  data = ordinal_data,
+  Hess = TRUE,
+  method = "logistic"
+)
+
+summary(ordinal_model)
+
+coef_table <- coef(summary(ordinal_model))
+beta <- coef_table["ERBB2_10k", "Value"]
+SE <- coef_table["ERBB2_10k", "Std. Error"]
+z <- beta / SE
+p_value <- 2 * pnorm(abs(z), lower.tail = FALSE)
+OR <- exp(beta)
+CI_lower <- exp(beta - 1.96 * SE)
+CI_upper <- exp(beta + 1.96 * SE)
+
+data.frame(
+  Predictor = "ERBB2 expression per 10,000 units",
+  Odds_Ratio = round(OR, 3),
+  CI_Lower = round(CI_lower, 3),
+  CI_Upper = round(CI_upper, 3),
+  P_Value = round(p_value, 4)
+)
+```
+
+The estimated odds ratio was **1.010 per 10,000-unit increase in ERBB2 expression** (95% CI: **0.975-1.046, p = 0.588**). Thus, there was no statistically significant evidence that increasing ERBB2 expression was associated with a higher disease-stage category.
+
+# Proportional-Odds Assumption
+
+```{r assumption-test}
+library(ordinal)
+
+clm_model <- clm(
+  Stage_Group ~ ERBB2_10k,
+  data = ordinal_data,
+  link = "logit"
+)
+
+nominal_test(clm_model)
+```
+
+The nominal-effects test was not statistically significant (**LRT = 1.806, p = 0.179**), providing no evidence against the proportional-odds assumption.
+
+# Comparison of Methods
+
+The ANOVA and ordinal logistic regression addressed related but distinct statistical questions. ANOVA tested whether mean ERBB2 expression differed among stage groups, whereas ordinal logistic regression modeled disease stage as an ordered outcome and estimated whether ERBB2 expression was associated with the odds of belonging to a more advanced stage category.
+
+Both analyses produced nonsignificant results. However, ordinal logistic regression directly incorporated the clinically meaningful ordering of disease stage and produced an odds ratio describing the association between ERBB2 expression and progression toward higher stage categories.
+
+# Biological and Clinical Interpretation
+
+In this TCGA-BRCA subset, tumor ERBB2 mRNA expression alone was not significantly associated with disease stage. This does not imply that ERBB2 lacks biological or clinical importance in breast cancer. Instead, it indicates that ERBB2 expression alone did not show a detectable relationship with ordered disease stage in this sample.
+
+The analysis was limited by the sample size and stage distribution. Stage IV contained only two patients and was therefore combined with Stage III. ERBB2 expression was also strongly right-skewed, with several high-expression observations.
+
+# Conclusion
+
+This analysis demonstrated proportional-odds ordinal logistic regression for an ordered biomedical outcome. Among 102 TCGA-BRCA patients, ERBB2 tumor expression was not significantly associated with higher disease stage (OR = 1.010 per 10,000 expression units, 95% CI: 0.975-1.046, p = 0.588). The proportional-odds assumption showed no statistically detectable violation (p = 0.179).
+
+Compared with a conventional ANOVA, ordinal logistic regression provided a model that explicitly preserved the ordered structure of disease stage, illustrating why ordinal methods can be useful for ordered clinical outcomes.
