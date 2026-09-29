@@ -1,0 +1,230 @@
+---
+title: "Robust Confidence Intervals for Biomedical Regression"
+subtitle: "HC3 Analysis of the Breast Cancer Coimbra Dataset"
+author: "Jagruthi Maroju"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Introduction
+
+Standard linear regression confidence intervals rely on assumptions about the variability of model errors. One important assumption is homoskedasticity, meaning that residual variance is approximately constant across observations. When this assumption is violated, conventional standard errors may not accurately represent uncertainty in estimated regression coefficients.
+
+This analysis demonstrates heteroskedasticity-consistent standard errors using the HC3 estimator. HC3 modifies the estimated covariance matrix of a regression model while leaving the regression coefficients unchanged. The goal is to compare a conventional 95% confidence interval with an HC3 robust confidence interval for the same coefficient.
+
+The analysis uses the UCI Breast Cancer Coimbra dataset and examines the relationship between breast cancer classification and the Homeostatic Model Assessment (HOMA), a continuous measure related to insulin resistance.
+
+# Data
+
+The Breast Cancer Coimbra dataset contains biomedical measurements from healthy participants and patients with breast cancer. The dataset is downloaded directly from the UCI Machine Learning Repository so the analysis is reproducible.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(sandwich)
+library(lmtest)
+
+data_url <- paste0(
+    "https://archive.ics.uci.edu/",
+    "static/public/451/data.csv"
+)
+
+DF <- read.csv(data_url)
+
+DF$Classification <- factor(
+    DF$Classification,
+    levels = c(1, 2),
+    labels = c("Healthy", "Breast Cancer")
+)
+
+dim(DF)
+table(DF$Classification)
+```
+
+The dataset contains 116 observations, including 52 healthy participants and 64 participants classified as having breast cancer.
+
+# Exploratory Comparison
+
+The distribution of HOMA was first compared between the two clinical groups.
+
+```{r exploratory-plot, fig.width=7, fig.height=5}
+boxplot(
+    HOMA ~ Classification,
+    data = DF,
+    xlab = "Classification",
+    ylab = "HOMA",
+    main = "HOMA by Clinical Classification"
+)
+```
+
+The plot provides an initial view of differences in HOMA between the healthy and breast cancer groups and the variability within each group.
+
+# Linear Regression Model
+
+A linear regression model was fitted with HOMA as the response and clinical classification as the predictor.
+
+```{r linear-model}
+model <- lm(
+    HOMA ~ Classification,
+    data = DF
+)
+
+summary(model)
+```
+
+In this model, the coefficient for `ClassificationBreast Cancer` represents the estimated difference in mean HOMA between the breast cancer and healthy groups.
+
+```{r coefficient}
+estimate <- coef(model)["ClassificationBreast Cancer"]
+estimate
+```
+
+The estimated difference was approximately **2.07 HOMA units**, with the breast cancer group having the higher mean in this dataset.
+
+# Conventional Confidence Interval
+
+A conventional 95% confidence interval was calculated using `confint()`.
+
+```{r conventional-ci}
+standard_CI <- confint(
+    model,
+    "ClassificationBreast Cancer",
+    level = 0.95
+)
+
+standard_CI
+```
+
+The conventional 95% confidence interval was approximately **0.77 to 3.37 HOMA units**. Because the interval does not contain zero, the conventional analysis supports a difference in mean HOMA between the two groups.
+
+# Assessment of Heteroskedasticity
+
+Heteroskedasticity was evaluated using the Breusch-Pagan test.
+
+```{r breusch-pagan}
+bp <- lmtest::bptest(model)
+bp
+```
+
+The Breusch-Pagan test produced a p-value of approximately **0.046**. At the 0.05 significance level, this provides evidence that the constant-variance assumption may not hold for this model. This makes a heteroskedasticity-consistent estimate of coefficient uncertainty useful as a sensitivity analysis.
+
+# HC3 Robust Confidence Interval
+
+The HC3 covariance estimator was calculated using `vcovHC()` from the `sandwich` package.
+
+```{r robust-ci}
+V_HC3 <- sandwich::vcovHC(
+    model,
+    type = "HC3"
+)
+
+HC3_SE <- sqrt(diag(V_HC3))[
+    "ClassificationBreast Cancer"
+]
+
+HC3_CI <- c(
+    Lower = estimate - qnorm(0.975) * HC3_SE,
+    Upper = estimate + qnorm(0.975) * HC3_SE
+)
+
+HC3_SE
+HC3_CI
+```
+
+The HC3 robust 95% confidence interval was approximately **0.89 to 3.25 HOMA units**. The coefficient itself remains unchanged at approximately 2.07 because HC3 modifies the estimate of uncertainty rather than the fitted group difference.
+
+# Comparison of Confidence Intervals
+
+```{r ci-comparison}
+CI_comparison <- data.frame(
+    Method = c(
+        "Conventional",
+        "HC3 Robust"
+    ),
+    Estimate = c(
+        unname(estimate),
+        unname(estimate)
+    ),
+    Lower = c(
+        unname(standard_CI[1]),
+        unname(HC3_CI["Lower"])
+    ),
+    Upper = c(
+        unname(standard_CI[2]),
+        unname(HC3_CI["Upper"])
+    ),
+    stringsAsFactors = FALSE
+)
+
+rownames(CI_comparison) <- NULL
+
+CI_comparison
+```
+
+The intervals can also be compared visually.
+
+```{r ci-plot, fig.width=7, fig.height=5}
+
+# Extract finite numeric values for plotting
+plot_estimate <- as.numeric(estimate)
+plot_lower <- c(
+    as.numeric(standard_CI[1, 1]),
+    as.numeric(HC3_CI[1])
+)
+plot_upper <- c(
+    as.numeric(standard_CI[1, 2]),
+    as.numeric(HC3_CI[2])
+)
+
+# Determine plotting limits
+plot_ylim <- range(
+    c(plot_lower, plot_upper, 0),
+    finite = TRUE
+)
+
+plot(
+    1:2,
+    rep(plot_estimate, 2),
+    ylim = plot_ylim,
+    xaxt = "n",
+    xlab = "",
+    ylab = "Estimated Difference in HOMA",
+    main = "Conventional vs. HC3 Robust 95% Confidence Intervals",
+    pch = 16
+)
+
+segments(
+    x0 = 1:2,
+    y0 = plot_lower,
+    x1 = 1:2,
+    y1 = plot_upper,
+    lwd = 2
+)
+
+axis(
+    1,
+    at = 1:2,
+    labels = c("Conventional", "HC3 Robust")
+)
+
+abline(h = 0, lty = 2)
+```
+
+The conventional interval had a width of approximately **2.59**, while the HC3 interval had a width of approximately **2.36**, making the HC3 interval about **8.9% narrower** in this analysis.
+
+Importantly, a robust interval is not necessarily wider than a conventional interval. The purpose of HC3 is to estimate coefficient uncertainty without relying on constant residual variance, rather than simply making inference more conservative.
+
+# Statistical and Biomedical Interpretation
+
+Both approaches lead to the same overall conclusion for this dataset. The estimated mean HOMA difference between the breast cancer and healthy groups is approximately 2.07 units, and both 95% confidence intervals remain above zero. Therefore, accounting for heteroskedasticity does not remove the observed positive association between breast cancer classification and HOMA in this sample.
+
+The robust analysis provides information that the conventional interval alone does not. The Breusch-Pagan result indicates that the constant-variance assumption underlying conventional inference may be questionable, while the HC3 interval demonstrates that the estimated group difference remains separated from zero when uncertainty is calculated using a heteroskedasticity-consistent covariance estimator.
+
+From a biomedical perspective, the breast cancer group in this dataset had higher mean HOMA values than the healthy group. Because HOMA is related to insulin resistance, the observed difference suggests an association between clinical classification and metabolic characteristics in this sample. However, this observational analysis does not establish causation, and potential confounding variables are not controlled in this simple model.
+
+# Conclusion
+
+This analysis demonstrates how HC3 robust standard errors can complement conventional regression confidence intervals when residual variance may not be constant. The conventional 95% confidence interval was approximately **0.77 to 3.37**, compared with an HC3 robust interval of approximately **0.89 to 3.25**.
+
+The statistical conclusion was consistent across both methods, but HC3 provided an estimate of uncertainty that did not require the same constant-variance assumption. This illustrates why robust standard errors can be useful as a sensitivity analysis in biomedical regression.
