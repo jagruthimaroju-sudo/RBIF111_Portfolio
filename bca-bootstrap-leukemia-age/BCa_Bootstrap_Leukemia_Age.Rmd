@@ -1,0 +1,183 @@
+---
+title: "BCa Bootstrap Confidence Intervals for Age Differences in Acute Lymphoblastic Leukemia"
+author: "Bioinformatics Portfolio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+set.seed(20261008)
+```
+
+## Introduction
+
+A confidence interval quantifies uncertainty in an estimated population quantity. The percentile bootstrap constructs an interval directly from the empirical distribution of resampled estimates. The **bias-corrected and accelerated (BCa) bootstrap** instead adjusts the selected quantiles for median bias and changes in the estimator's standard error. BCa intervals can be useful when the sampling distribution is asymmetric, although they are not guaranteed to outperform simpler intervals in every dataset.
+
+This report compares the mean age of patients with **BCR/ABL-positive** acute lymphoblastic leukemia (ALL) and patients classified as **NEG** for the molecular marker in the Bioconductor `ALL` dataset. The target statistic is the difference in group mean ages, BCR/ABL minus NEG, in years. This is an observational comparison, not an estimate of a causal effect of leukemia subtype on age.
+
+## Data and reproducibility
+
+The dataset is loaded directly from the Bioconductor `ALL` package, rather than from a local homework file. To install missing packages once, uncomment the installation block below.
+
+```{r installation, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("ALL", ask = FALSE, update = FALSE)
+install.packages(c("boot", "ggplot2", "knitr"))
+```
+
+```{r load-data}
+stopifnot(requireNamespace("ALL", quietly = TRUE),
+          requireNamespace("Biobase", quietly = TRUE),
+          requireNamespace("boot", quietly = TRUE),
+          requireNamespace("ggplot2", quietly = TRUE),
+          requireNamespace("knitr", quietly = TRUE))
+data("ALL", package = "ALL")
+clinical <- Biobase::pData(ALL)
+stopifnot(all(c("age", "mol.biol") %in% names(clinical)))
+clinical$age <- suppressWarnings(as.numeric(as.character(clinical$age)))
+clinical$mol.biol <- as.character(clinical$mol.biol)
+analysis_data <- clinical[
+  clinical$mol.biol %in% c("BCR/ABL", "NEG") &
+    is.finite(clinical$age), c("age", "mol.biol"), drop = FALSE]
+names(analysis_data) <- c("age", "group")
+analysis_data$group <- factor(analysis_data$group, levels = c("NEG", "BCR/ABL"))
+stopifnot(all(table(analysis_data$group) >= 3))
+knitr::kable(as.data.frame(table(analysis_data$group)),
+             col.names = c("Molecular group", "Patients"),
+             caption = "Sample sizes after removing missing ages")
+```
+
+```{r descriptives}
+group_summary <- aggregate(age ~ group, analysis_data,
+                           function(x) c(n = length(x), mean = mean(x),
+                                         median = median(x), sd = sd(x)))
+summary_table <- data.frame(Group = group_summary$group,
+                            group_summary$age, check.names = FALSE)
+knitr::kable(summary_table, digits = 2,
+             caption = "Age summaries by molecular classification")
+```
+
+```{r age-plot, fig.cap="Age distributions in the two molecular groups. Each point represents one patient."}
+ggplot2::ggplot(analysis_data, ggplot2::aes(x = group, y = age)) +
+  ggplot2::geom_boxplot(outlier.shape = NA, width = 0.4) +
+  ggplot2::geom_jitter(width = 0.12, alpha = 0.6) +
+  ggplot2::labs(x = "Molecular classification", y = "Age (years)",
+                title = "Patient age by ALL molecular group") +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+## Statistical methods
+
+We estimate the difference in mean ages, BCR/ABL minus NEG. The two groups are **resampled independently within group** so that each bootstrap replicate retains the observed group sizes. We compare three 95% confidence intervals for the same mean difference:
+
+1. A Welch *t* interval, which relies on a normal approximation for the mean difference.
+2. A percentile bootstrap interval, using the 2.5th and 97.5th percentiles of bootstrap differences.
+3. A BCa bootstrap interval, which adjusts those quantiles for bias and acceleration.
+
+We use 10,000 bootstrap replicates and a fixed random seed for reproducibility. The resampling unit is the patient. The BCa acceleration is calculated using the jackknife influence values supplied by `boot.ci()`; `stype = "i"` provides the appropriate index-based resampling interface.
+
+```{r bootstrap}
+control_age <- analysis_data$age[analysis_data$group == "NEG"]
+treatment_age <- analysis_data$age[analysis_data$group == "BCR/ABL"]
+observed_diff <- mean(treatment_age) - mean(control_age)
+
+# Keep group sizes fixed by using a two-stratum bootstrap.
+boot_stat <- function(data, indices) {
+  d <- data[indices, , drop = FALSE]
+  mean(d$age[d$group == "BCR/ABL"]) -
+    mean(d$age[d$group == "NEG"])
+}
+
+set.seed(20261008)
+boot_fit <- boot::boot(
+  data = analysis_data,
+  statistic = boot_stat,
+  R = 10000,
+  strata = analysis_data$group,
+  sim = "ordinary",
+  stype = "i"
+)
+
+# All three methods estimate the same BCR/ABL minus NEG mean difference.
+percentile_ci <- boot::boot.ci(boot_fit, conf = 0.95, type = "perc")
+bca_ci <- boot::boot.ci(boot_fit, conf = 0.95, type = "bca")
+welch <- stats::t.test(treatment_age, control_age, conf.level = 0.95)
+
+stopifnot(is.finite(observed_diff),
+          all(is.finite(percentile_ci$percent[4:5])),
+          all(is.finite(bca_ci$bca[4:5])))
+
+ci_table <- data.frame(
+  Method = c("Welch t", "Percentile bootstrap", "BCa bootstrap"),
+  Estimate_years = rep(observed_diff, 3),
+  Lower_95 = c(welch$conf.int[1], percentile_ci$percent[4], bca_ci$bca[4]),
+  Upper_95 = c(welch$conf.int[2], percentile_ci$percent[5], bca_ci$bca[5])
+)
+ci_table$Width <- ci_table$Upper_95 - ci_table$Lower_95
+knitr::kable(ci_table, digits = 2,
+             caption = "Three 95% confidence intervals for the same mean age difference")
+```
+
+```{r bootstrap-plot, fig.cap="Bootstrap distribution of the mean age difference with percentile and BCa interval endpoints."}
+bootstrap_df <- data.frame(diff = as.numeric(boot_fit$t[, 1]))
+endpoints <- data.frame(
+  x = c(percentile_ci$percent[4:5], bca_ci$bca[4:5]),
+  Method = rep(c("Percentile", "BCa"), each = 2)
+)
+ggplot2::ggplot(bootstrap_df, ggplot2::aes(x = diff)) +
+  ggplot2::geom_histogram(bins = 45, fill = "grey75", color = "white") +
+  ggplot2::geom_vline(xintercept = observed_diff, linewidth = 0.8) +
+  ggplot2::geom_vline(data = endpoints,
+                      ggplot2::aes(xintercept = x, linetype = Method),
+                      linewidth = 0.8) +
+  ggplot2::labs(x = "Bootstrap difference in mean age (years)",
+                y = "Bootstrap replicates",
+                title = "Bootstrap uncertainty in the age difference") +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+```{r ci-plot, fig.cap="Comparison of 95% confidence interval methods for the same estimated mean age difference."}
+ggplot2::ggplot(ci_table,
+                ggplot2::aes(y = Method, x = Estimate_years)) +
+  ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  ggplot2::geom_segment(ggplot2::aes(x = Lower_95, xend = Upper_95,
+                                    yend = Method), linewidth = 1.2) +
+  ggplot2::geom_point(size = 2.5) +
+  ggplot2::labs(x = "Difference in mean age (BCR/ABL minus NEG), years",
+                y = NULL, title = "95% confidence interval comparison") +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+## Results and interpretation
+
+The observed mean age difference was **`r sprintf('%.2f', observed_diff)` years** (BCR/ABL minus NEG). The percentile bootstrap interval was **[`r sprintf('%.2f', percentile_ci$percent[4])`, `r sprintf('%.2f', percentile_ci$percent[5])`] years**, while the BCa interval was **[`r sprintf('%.2f', bca_ci$bca[4])`, `r sprintf('%.2f', bca_ci$bca[5])`] years**. The Welch interval was **[`r sprintf('%.2f', welch$conf.int[1])`, `r sprintf('%.2f', welch$conf.int[2])`] years**.
+
+The BCa method changes the confidence interval endpoints by **`r sprintf('%.2f', bca_ci$bca[4] - percentile_ci$percent[4])` years** at the lower bound and **`r sprintf('%.2f', bca_ci$bca[5] - percentile_ci$percent[5])` years** at the upper bound relative to the percentile method. This adjustment reflects the BCa algorithm's correction for bias and acceleration; it does not establish that the BCa interval has better coverage for this particular sample.
+
+`r if (bca_ci$bca[4] > 0 || bca_ci$bca[5] < 0) 'The BCa interval excludes zero, which is consistent with a nonzero difference in average age between these molecular groups at the 95% confidence level.' else 'The BCa interval includes zero, so these data do not rule out a zero difference in average age between the two molecular groups at the 95% confidence level.'` The same zero-exclusion criterion should be considered for the other methods rather than treating any single interval as definitive.
+
+**Clinical interpretation:** Age at diagnosis is a patient characteristic that may differ across ALL molecular subtypes and can be relevant when describing a clinical cohort. These estimates describe the observed age composition of the two groups; they do **not** show that BCR/ABL status causes an age difference, predict prognosis, or establish treatment effects. The `NEG` category is the dataset's molecular classification label and should not be interpreted as a universal absence of all leukemia-associated abnormalities.
+
+## Limitations
+
+The analysis assumes independent patient observations and representative sampling. A bootstrap cannot correct selection bias, missing-not-at-random age values, or confounding. BCa intervals can be unstable with small or highly discrete samples, and bootstrap uncertainty is conditional on the available cohort. Only two molecular groups were selected, and no adjustment for other clinical variables was attempted. The Welch and bootstrap intervals also make different assumptions, so numerical differences are not automatically evidence that one is superior. This demonstration intentionally focuses on **interval estimation**, not hypothesis testing or clinical prediction.
+
+## Reproducibility and session information
+
+```{r session-info}
+sessionInfo()
+```
+
+## References
+
+- Efron, B. (1987). Better bootstrap confidence intervals. *Journal of the American Statistical Association, 82*(397), 171–185. https://doi.org/10.1080/01621459.1987.10478410
+- Davison, A. C., & Hinkley, D. V. (1997). *Bootstrap Methods and Their Application*. Cambridge University Press.
+- R Core Team. *boot* package documentation, `boot()` and `boot.ci()`.
+- Bioconductor. *ALL* experiment data package documentation (including source-study references).
