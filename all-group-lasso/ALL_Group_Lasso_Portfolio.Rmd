@@ -1,0 +1,160 @@
+---
+title: "Grouped Feature Selection for Leukemia Classification"
+subtitle: "A reproducible comparison of group lasso and ordinary lasso"
+author: "Bioinformatics Portfolio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.width=8, fig.height=5)
+set.seed(111)
+needed <- c("ALL", "Biobase", "grpreg", "glmnet", "pROC", "knitr")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop("Install missing packages first: ", paste(missing, collapse=", "),
+  ". For ALL and Biobase use BiocManager::install(); for the others use install.packages().")
+```
+
+# Introduction
+
+High-dimensional gene-expression datasets often contain many more predictors than patients. Ordinary lasso can select individual expression features, whereas **group lasso** selects predefined groups of predictors together. This report compares these methods for predicting leukemia lineage using the Bioconductor `ALL` dataset. The grouping used here is an **illustrative, annotation-based partition**, not a validated pathway map. Consequently, selected groups should not be interpreted as independently confirmed biological pathways.
+
+# Reproducible data loading
+
+```{r load-data}
+data("ALL", package="ALL")
+stopifnot(inherits(ALL, "ExpressionSet"))
+expr <- Biobase::exprs(ALL)
+meta <- Biobase::pData(ALL)
+stopifnot("BT" %in% names(meta))
+# BT records B- versus T-lineage ALL in the dataset. Exclude unclassified records.
+lineage <- substr(as.character(meta$BT), 1, 1)
+keep <- lineage %in% c("B", "T")
+expr <- expr[, keep, drop=FALSE]
+y <- as.integer(lineage[keep] == "T")
+stopifnot(length(unique(y)) == 2, ncol(expr) == length(y))
+knitr::kable(data.frame(Lineage=c("B-lineage", "T-lineage"), N=as.integer(table(factor(y, levels=c(0,1))))))
+```
+
+# Feature grouping and leakage prevention
+
+The dataset does not provide an immediate one-to-one mapping from its probe IDs to nonoverlapping curated pathways. To demonstrate the group penalty without inventing pathway membership, we form **blocks of expression probes ordered by their probe identifiers**. These blocks are a computational demonstration of grouped selection, not biological modules. A biological extension would use externally curated, nonoverlapping gene sets after verified probe-to-gene mapping.
+
+All outcome-dependent filtering is done **within training folds**. We use the same 120 most variable probes, selected *without outcome labels* from each training set, for both models. Group assignments are deterministic within each training fold.
+
+```{r helpers}
+# Small, transparent, reproducible model suitable for ~100 samples.
+# A larger feature set would require more samples and more computation.
+make_predictors <- function(train_expr, test_expr, n_features=120, group_size=10) {
+  v <- apply(train_expr, 1, var)
+  ids <- names(sort(v, decreasing=TRUE))[seq_len(min(n_features, sum(is.finite(v) & v>0)))]
+  ids <- sort(ids) # stable grouping by probe identifier
+  xt <- t(train_expr[ids, , drop=FALSE])
+  xv <- t(test_expr[ids, , drop=FALSE])
+  grp <- rep(seq_len(ceiling(length(ids)/group_size)), each=group_size)[seq_along(ids)]
+  list(train=xt, test=xv, groups=grp, ids=ids)
+}
+
+fit_predict <- function(train_idx, test_idx, lambda_folds=4) {
+  p <- make_predictors(expr[,train_idx,drop=FALSE], expr[,test_idx,drop=FALSE])
+  ytr <- y[train_idx]
+  # grpreg's logistic family and group penalty; its CV selects lambda.
+  set.seed(1000 + sum(train_idx))
+  cvg <- grpreg::cv.grpreg(p$train, ytr, group=p$groups,
+                            family="binomial", penalty="grLasso", nfolds=lambda_folds)
+  gfit <- cvg$fit
+  pg <- as.numeric(predict(gfit, X=p$test, lambda=cvg$lambda.min, type="response"))
+  # Ordinary lasso, same training predictors and same outcome.
+  set.seed(2000 + sum(train_idx))
+  cvl <- glmnet::cv.glmnet(p$train, ytr, family="binomial", alpha=1,
+                           nfolds=lambda_folds, type.measure="deviance")
+  pl <- as.numeric(predict(cvl, newx=p$test, s="lambda.min", type="response"))
+  # Selected features/groups for descriptive comparison.
+  cg <- as.matrix(coef(gfit, lambda=cvg$lambda.min))[-1,1]
+  cl <- as.matrix(coef(cvl, s="lambda.min"))[-1,1]
+  list(pg=pg, pl=pl, ng=sum(abs(cg)>1e-8), nl=sum(abs(cl)>1e-8),
+       n_groups=length(unique(p$groups[abs(cg)>1e-8])),
+       selected_group_ids=unique(p$groups[abs(cg)>1e-8]),
+       selected_lasso_ids=p$ids[abs(cl)>1e-8])
+}
+```
+
+# Nested cross-validation comparison
+
+The outer five folds provide held-out predictions. Each training split performs an independent inner cross-validation to select the penalty. This reduces the optimistic bias caused by selecting and evaluating a tuning parameter on the same folds. Group lasso and lasso use identical outer splits and the same predictors within each split.
+
+```{r nested-cv}
+set.seed(111)
+fold <- integer(length(y))
+for (cls in c(0,1)) {
+  ix <- which(y == cls)
+  fold[ix] <- sample(rep(1:5, length.out=length(ix)))
+}
+stopifnot(all(table(fold, y)>0))
+pred.group <- pred.lasso <- rep(NA_real_, length(y))
+fold.info <- vector("list", 5)
+for (k in 1:5) {
+  tr <- which(fold != k); te <- which(fold == k)
+  z <- fit_predict(tr, te)
+  pred.group[te] <- z$pg
+  pred.lasso[te] <- z$pl
+  fold.info[[k]] <- data.frame(Fold=k, GroupLasso_Features=z$ng,
+                              GroupLasso_Groups=z$n_groups, Lasso_Features=z$nl)
+}
+stopifnot(all(is.finite(pred.group)), all(is.finite(pred.lasso)))
+feature_summary <- do.call(rbind, fold.info)
+knitr::kable(feature_summary, digits=2,
+             caption="Selected feature counts in each outer training fold")
+```
+
+# Predictive performance
+
+```{r performance}
+roc.g <- pROC::roc(y, pred.group, levels=c(0,1), direction="<", quiet=TRUE)
+roc.l <- pROC::roc(y, pred.lasso, levels=c(0,1), direction="<", quiet=TRUE)
+auc.g <- as.numeric(pROC::auc(roc.g))
+auc.l <- as.numeric(pROC::auc(roc.l))
+logloss <- function(prob, truth) {
+  prob <- pmin(pmax(prob, 1e-6), 1-1e-6)
+  -mean(truth*log(prob) + (1-truth)*log(1-prob))
+}
+performance <- data.frame(Method=c("Group lasso", "Ordinary lasso"),
+                          Outer_CV_AUC=c(auc.g,auc.l),
+                          Outer_CV_LogLoss=c(logloss(pred.group,y),logloss(pred.lasso,y)))
+knitr::kable(performance, digits=3, caption="Held-out outer-fold classification performance")
+plot(roc.g, col="steelblue", lwd=2, main="Nested cross-validated ROC curves")
+plot(roc.l, add=TRUE, col="firebrick", lwd=2)
+abline(0,1,lty=2,col="gray60")
+legend("bottomright", legend=sprintf("%s: AUC %.3f",performance$Method,performance$Outer_CV_AUC),
+       col=c("steelblue","firebrick"),lwd=2,bty="n")
+```
+
+# Interpretation
+
+The group lasso achieved an outer-fold AUC of **`r sprintf('%.3f', auc.g)`** and a log loss of **`r sprintf('%.3f', performance$Outer_CV_LogLoss[1])`**. Ordinary lasso achieved an outer-fold AUC of **`r sprintf('%.3f', auc.l)`** and a log loss of **`r sprintf('%.3f', performance$Outer_CV_LogLoss[2])`**. `r if (auc.g > auc.l) 'Group lasso had the higher held-out AUC in this run.' else if (auc.g < auc.l) 'Ordinary lasso had the higher held-out AUC in this run.' else 'Both methods had the same held-out AUC in this run.'` This is a comparison on one dataset and one outer-fold partition, not evidence of general superiority.
+
+Across outer folds, group lasso selected a median of **`r median(feature_summary$GroupLasso_Groups)`** probe blocks and **`r median(feature_summary$GroupLasso_Features)`** individual features, while ordinary lasso selected a median of **`r median(feature_summary$Lasso_Features)`** individual features. The distinctive result is the **unit of selection**: group lasso retained or discarded whole blocks, whereas ordinary lasso could retain isolated probes. Group lasso can be useful when scientifically defensible groups represent pathways or functional units; here, the arbitrary blocks demonstrate the algorithm but **do not support a pathway-level biological claim**.
+
+The outcome is B- versus T-lineage acute lymphoblastic leukemia, a clinically and biologically meaningful distinction. Any successful discrimination indicates that expression patterns contain information about lineage. However, the selected probe blocks are not validated biomarkers, and the dataset is too small to justify clinical use. A stronger follow-up would map probes to genes, use curated nonoverlapping gene sets, assess selection stability across repeated outer folds, and validate in an independent cohort.
+
+# Limitations and reproducibility
+
+- This is a demonstration of **grouped feature selection**, not pathway enrichment or causal inference.
+- Feature blocks are based on probe identifiers, not verified functional relationships.
+- Feature screening uses only training data, avoiding test-label leakage; variance screening is unsupervised.
+- The inner tuning and outer evaluation are separated, but results can still vary with the fold split.
+- Model performance should not be generalized to clinical deployment without external validation.
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+Yuan, M., & Lin, Y. (2006). Model selection and estimation in regression with grouped variables. *Journal of the Royal Statistical Society: Series B*, 68(1), 49–67.
+
+Breheny, P., & Huang, J. (2015). Group descent algorithms for nonconvex penalized linear and logistic regression models with grouped predictors. *Statistics and Computing*, 25, 173–187.
