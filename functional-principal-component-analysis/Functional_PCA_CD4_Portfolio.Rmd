@@ -1,0 +1,184 @@
+---
+title: "Functional Principal Component Analysis of Longitudinal CD4 Counts"
+subtitle: "Sparse longitudinal trajectories compared with a linear mixed-effects model"
+author: "RBIF-111 Statistical Methods Portfolio"
+date: "2026-10-20"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    df_print: kable
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5.8, dpi=120)
+required <- c("refund", "fdapace", "nlme", "dplyr", "tidyr", "ggplot2", "knitr")
+missing_packages <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing_packages)) stop("Install required packages: ", paste(missing_packages, collapse=", "))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+set.seed(111)
+```
+
+```{r data-preparation}
+data("cd4", package="refund")
+cd4_matrix <- as.matrix(cd4)
+cd4_long <- as.data.frame(cd4_matrix) |>
+  dplyr::mutate(PatientID=seq_len(nrow(cd4_matrix))) |>
+  tidyr::pivot_longer(cols=-PatientID, names_to="Month", values_to="CD4_Count") |>
+  dplyr::mutate(Month=as.numeric(Month), PatientID=factor(PatientID)) |>
+  dplyr::filter(!is.na(CD4_Count)) |>
+  dplyr::arrange(PatientID, Month)
+stopifnot(nrow(cd4_long)==1888, dplyr::n_distinct(cd4_long$PatientID)==366)
+knitr::kable(data.frame(Patients=dplyr::n_distinct(cd4_long$PatientID),
+                         Observations=nrow(cd4_long),
+                         Median_per_patient=median(as.numeric(table(cd4_long$PatientID))),
+                         Median_CD4=median(cd4_long$CD4_Count)))
+```
+
+# Introduction
+
+Repeated CD4 measurements following HIV seroconversion are sparse and unevenly timed. A conventional linear mixed-effects model estimates an average time trend and patient-specific linear departures, but may miss nonlinear differences in the shapes of longitudinal trajectories. **Functional principal component analysis (FPCA)** models each patient's underlying trajectory as a smooth mean function plus weighted eigenfunctions, allowing flexible characterization of dominant between-patient patterns. This portfolio applies sparse FPCA to the real `cd4` dataset distributed with the R package `refund` and compares it with a conventional random-intercept/random-slope linear mixed-effects model fitted to the **same CD4 outcome**.
+
+# Data and reproducibility
+
+The `refund::cd4` matrix contains 366 patients observed at months −18 through 42 relative to seroconversion. Missing entries are omitted rather than imputed. The 1,888 observed CD4 measurements correspond to a median of five per patient (range 1–11); the median CD4 measurement is 694 (range 10–3,184). The R Markdown file loads its source data directly from the package; it does not require previously saved CSV files, fitted objects, or image files.
+
+# Exploratory longitudinal analysis
+
+The distribution of observation times is uneven, with marked concentrations at several scheduled months. The population-level LOESS curve suggests a nonlinear decline in CD4 values, while individual observed trajectories show substantial heterogeneity. Some patients have only one measurement; their individual slopes cannot be estimated reliably from their data alone.
+
+```{r exploratory-plots, fig.height=5.2}
+set.seed(111)
+eligible <- cd4_long |> dplyr::count(PatientID) |> dplyr::filter(n >= 2) |> dplyr::pull(PatientID)
+selected <- sample(as.character(eligible), 20)
+individual <- cd4_long |> dplyr::filter(as.character(PatientID) %in% selected)
+ggplot(individual, aes(Month, CD4_Count, group=PatientID)) +
+  geom_line(color="steelblue", linewidth=.65) + geom_point(color="steelblue", size=1.4) +
+  facet_wrap(~PatientID, ncol=4) + theme_bw() +
+  labs(title="Observed trajectories for 20 patients with repeated measures",
+       x="Months relative to seroconversion", y="CD4 count")
+
+ggplot(cd4_long, aes(Month, CD4_Count)) +
+  geom_point(alpha=.12) +
+  geom_smooth(method="loess", formula=y~x, se=TRUE, color="blue") +
+  geom_vline(xintercept=0, linetype="dashed", color="red") +
+  theme_bw() + labs(title="Observed CD4 values and exploratory LOESS trend")
+
+ggplot(cd4_long, aes(Month)) + geom_bar(fill="steelblue") +
+  theme_bw() + labs(title="Observation availability by month", y="Number of measurements")
+```
+
+# Sparse functional principal component analysis
+
+For each patient, `Lt` contains observation times and `Ly` contains CD4 measurements in matching order. Sparse FPCA pools data across patients to estimate a smooth mean, covariance surface, eigenfunctions, and conditional subject scores. Components are selected using a 95% cumulative fraction-of-variance-explained (FVE) threshold, with a maximum of five components.
+
+```{r fit-fpca, cache=TRUE}
+patient_data <- split(cd4_long, cd4_long$PatientID)
+Lt <- lapply(patient_data, function(x) as.numeric(x$Month))
+Ly <- lapply(patient_data, function(x) as.numeric(x$CD4_Count))
+fpca <- fdapace::FPCA(
+  Ly=Ly, Lt=Lt,
+  optns=list(dataType="Sparse", methodSelectK="FVE",
+             FVEthreshold=.95, maxK=5, error=TRUE)
+)
+variance_table <- data.frame(
+  Component=paste0("FPC", seq_along(fpca$lambda)),
+  Eigenvalue=round(fpca$lambda),
+  Individual_FVE=round(c(fpca$cumFVE[1], diff(fpca$cumFVE))*100, 2),
+  Cumulative_FVE=round(fpca$cumFVE*100, 2)
+)
+knitr::kable(variance_table, caption="Functional variance explained (%)")
+```
+
+In the verified analysis, three components were selected: FPC1 explained **82.65%**, FPC2 **10.00%**, and FPC3 **6.61%**, for **99.27% cumulative estimated functional variance**. These values describe a smoothed covariance decomposition, not out-of-sample predictive accuracy.
+
+```{r fpca-figures, fig.height=5.5}
+work_grid <- fpca$workGrid
+mu <- as.numeric(fpca$mu)
+phi <- as.matrix(fpca$phi)
+stopifnot(nrow(phi)==length(work_grid))
+
+ggplot(data.frame(Month=work_grid, CD4=mu), aes(Month, CD4)) +
+  geom_line(color="steelblue", linewidth=1.1) +
+  geom_vline(xintercept=0, color="red", linetype="dashed") +
+  theme_bw() + labs(title="Sparse FPCA population mean", y="Estimated CD4 count")
+
+eigen_df <- data.frame(Month=work_grid, phi, check.names=FALSE)
+names(eigen_df)[-1] <- paste0("FPC", seq_len(ncol(phi)))
+eigen_long <- tidyr::pivot_longer(eigen_df, -Month,
+                                   names_to="Component", values_to="Eigenfunction")
+ggplot(eigen_long, aes(Month, Eigenfunction)) +
+  geom_hline(yintercept=0, linetype="dashed", color="gray50") +
+  geom_line(color="darkgreen", linewidth=1) +
+  facet_wrap(~Component, scales="free_y") + theme_bw() +
+  labs(title="Functional eigenfunctions")
+
+effect_df <- dplyr::bind_rows(lapply(seq_len(ncol(phi)), function(k) {
+  shift <- sqrt(fpca$lambda[k])*phi[,k]
+  data.frame(Month=work_grid, Component=paste0("FPC",k),
+             Mean=mu, Lower=mu-shift, Upper=mu+shift)
+}))
+effect_long <- tidyr::pivot_longer(effect_df, c(Mean, Lower, Upper),
+                                     names_to="Curve", values_to="CD4")
+ggplot(effect_long, aes(Month, CD4, color=Curve, linetype=Curve)) +
+  geom_line(linewidth=.95) + facet_wrap(~Component, scales="free_y") +
+  theme_bw() + labs(title="Mean trajectory and ±1 SD component effects",
+                    y="Estimated CD4 count")
+```
+
+## Interpretation of eigenfunctions
+
+**FPC1: Overall CD4 level (82.65%).** Its eigenfunction is positive throughout follow-up, so its scores predominantly distinguish patients with higher versus lower trajectories; its magnitude varies by time.
+
+**FPC2: Early-versus-late contrast (10.00%).** The eigenfunction is mainly positive near the pre-seroconversion interval and negative later. Under the fitted sign convention, higher scores correspond to relatively higher early and lower late CD4 values, a stronger early-to-late contrast.
+
+**FPC3: Curvature (6.61%).** Positive contributions early and late, contrasted with negative values in the middle, reflect additional nonlinear shape differences. These should be interpreted cautiously because sampling is sparse and eigenfunction estimation depends on smoothing. Eigenfunction signs are arbitrary and could be reversed without changing the model.
+
+# Conventional comparison: linear mixed-effects model
+
+The standard model uses the same response, CD4 count, and the same observation times. Its fixed effects describe a straight-line population mean, while correlated random intercepts and slopes allow individual linear deviations.
+
+```{r mixed-model}
+lme_fit <- nlme::lme(
+  fixed=CD4_Count ~ Month, random=~Month | PatientID,
+  data=cd4_long, method="REML",
+  control=nlme::lmeControl(maxIter=200, msMaxIter=200, returnObject=TRUE)
+)
+print(summary(lme_fit))
+knitr::kable(data.frame(Term=names(nlme::fixef(lme_fit)),
+                         Estimate=as.numeric(nlme::fixef(lme_fit))))
+```
+
+In the verified fit, the population intercept was **859.99** CD4 units at month zero and the average slope was **−11.37 units per month** (p < 0.001). The random-intercept standard deviation was **277.511**, random-slope standard deviation **7.357**, residual standard deviation **228.092**, and intercept–slope correlation **−0.508**. The reported REML AIC was **26,786**, but this cannot be compared directly with FPCA's FVE.
+
+```{r model-comparison, fig.height=5.5}
+comparison <- data.frame(Month=work_grid, FPCA_Mean=mu)
+comparison$LME_Prediction <- as.numeric(
+  predict(lme_fit, newdata=data.frame(Month=work_grid), level=0)
+)
+comparison_long <- tidyr::pivot_longer(comparison, -Month,
+                                       names_to="Model", values_to="Predicted_CD4")
+ggplot(comparison_long, aes(Month, Predicted_CD4, color=Model)) +
+  geom_line(linewidth=1.1) +
+  geom_vline(xintercept=0, linetype="dashed", color="gray50") +
+  theme_bw() + labs(title="FPCA mean versus linear mixed-effects population trend",
+                    x="Months relative to seroconversion", y="Estimated CD4 count")
+```
+
+The mixed model imposes a constant average rate of decline, whereas the FPCA mean shows a sharper decline near seroconversion and early follow-up, followed by a flatter later trajectory. FPCA additionally summarizes nonlinear *between-patient* variability through FPC2 and FPC3, beyond the linear model's intercept and slope deviations. This demonstrates added **descriptive** flexibility, not superior predictive performance or causal insight.
+
+# Limitations and conclusion
+
+Measurements are irregular and clustered at particular months, and some patients have only one measurement. Covariance smoothing, extreme CD4 observations, and thin coverage near the time boundaries can affect estimated eigenfunctions and patient scores. FPC3 is especially vulnerable to overinterpretation. The estimated 99.27% functional variance explained is not an individual-level prediction R²; no held-out validation was conducted. Both analyses are observational and cannot establish effects of HIV seroconversion, treatments, or other clinical factors.
+
+**Conclusion:** Sparse FPCA identified three interpretable modes of CD4 trajectory variation: overall level, early-versus-late contrast, and nonlinear curvature. A standard linear mixed-effects model quantified a significant average linear decline but did not represent these nonlinear trajectory features directly. Used together, the methods provide complementary summaries of sparse longitudinal CD4 data.
+
+# References
+
+- Yao, F., Müller, H.-G., & Wang, J.-L. (2005). Functional data analysis for sparse longitudinal data. *Journal of the American Statistical Association, 100*(470), 577–590. https://doi.org/10.1198/016214504000001745
+- Pinheiro, J., Bates, D., & R Core Team. *nlme: Linear and Nonlinear Mixed Effects Models*. R package documentation.
+- Goldsmith, J., Scheipl, F., Huang, L., et al. *refund: Regression with Functional Data*. R package documentation.
+- Dai, X., Hadjipantelis, P., Han, K., & Ji, H. *fdapace: Functional Data Analysis and Empirical Dynamics*. R package documentation.
